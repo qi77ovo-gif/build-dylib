@@ -1,0 +1,114 @@
+name: Build DisableCloudKit Dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Create DisableCloudKit.m
+        run: |
+          cat << 'EOF' > DisableCloudKit.m
+          #import <Foundation/Foundation.h>
+          #import <CloudKit/CloudKit.h>
+          #import <objc/runtime.h>
+
+          @interface DummyCKContainer : NSObject
+          @end
+
+          @implementation DummyCKContainer
+
+          + (instancetype)sharedDummy {
+              static DummyCKContainer *instance = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  instance = [[DummyCKContainer alloc] init];
+              });
+              return instance;
+          }
+
+          - (BOOL)isKindOfClass:(Class)aClass {
+              if (aClass == [CKContainer class]) {
+                  return YES;
+              }
+              return [super isKindOfClass:aClass];
+          }
+
+          - (NSString *)containerIdentifier {
+              return @"iCloud.disabled.dummy";
+          }
+
+          - (void)accountStatusWithCompletionHandler:(void (^)(CKAccountStatus, NSError *))completionHandler {
+              if (completionHandler) {
+                  completionHandler(CKAccountStatusNoAccount, nil);
+              }
+          }
+
+          - (void)fetchUserRecordIDWithCompletionHandler:(void (^)(CKRecordID *, NSError *))completionHandler {
+              if (completionHandler) {
+                  NSError *err = [NSError errorWithDomain:CKErrorDomain code:CKErrorNotAuthenticated userInfo:nil];
+                  completionHandler(nil, err);
+              }
+          }
+
+          - (CKDatabase *)privateCloudDatabase { return (CKDatabase *)self; }
+          - (CKDatabase *)publicCloudDatabase  { return (CKDatabase *)self; }
+          - (CKDatabase *)sharedCloudDatabase  { return (CKDatabase *)self; }
+
+          - (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+              NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
+              if (!sig) sig = [CKContainer instanceMethodSignatureForSelector:aSelector];
+              if (!sig) sig = [CKDatabase instanceMethodSignatureForSelector:aSelector];
+              if (!sig) sig = [NSMethodSignature signatureWithObjCTypes:"@@:"];
+              return sig;
+          }
+
+          - (void)forwardInvocation:(NSInvocation *)anInvocation {
+          }
+
+          @end
+
+          __attribute__((constructor))
+          static void disable_cloudkit_init(void) {
+              Class ckClass = objc_getClass("CKContainer");
+              if (!ckClass) return;
+
+              Method mDefault = class_getClassMethod(ckClass, @selector(defaultContainer));
+              if (mDefault) {
+                  IMP imp = imp_implementationWithBlock(^id(id _self) {
+                      return [DummyCKContainer sharedDummy];
+                  });
+                  method_setImplementation(mDefault, imp);
+              }
+
+              Method mWithId = class_getClassMethod(ckClass, @selector(containerWithIdentifier:));
+              if (mWithId) {
+                  IMP imp = imp_implementationWithBlock(^id(id _self, NSString *identifier) {
+                      return [DummyCKContainer sharedDummy];
+                  });
+                  method_setImplementation(mWithId, imp);
+              }
+          }
+          EOF
+
+      - name: Compile arm64 dylib
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -dynamiclib -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -framework Foundation -framework CloudKit \
+            -install_name @rpath/DisableCloudKit.dylib \
+            DisableCloudKit.m -o DisableCloudKit.dylib
+          codesign -f -s - DisableCloudKit.dylib
+          file DisableCloudKit.dylib
+          otool -L DisableCloudKit.dylib
+
+      - name: Upload DisableCloudKit.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisableCloudKit
+          path: DisableCloudKit.dylib
