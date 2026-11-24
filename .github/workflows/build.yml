@@ -72,23 +72,95 @@ jobs:
 
           __attribute__((constructor))
           static void disable_cloudkit_init(void) {
+              // 1. 屏蔽 CloudKit 容器初始化闪退
               Class ckClass = objc_getClass("CKContainer");
-              if (!ckClass) return;
+              if (ckClass) {
+                  Method mDefault = class_getClassMethod(ckClass, @selector(defaultContainer));
+                  if (mDefault) {
+                      IMP imp = imp_implementationWithBlock(^id(id _self) {
+                          return [DummyCKContainer sharedDummy];
+                      });
+                      method_setImplementation(mDefault, imp);
+                  }
 
-              Method mDefault = class_getClassMethod(ckClass, @selector(defaultContainer));
-              if (mDefault) {
-                  IMP imp = imp_implementationWithBlock(^id(id _self) {
-                      return [DummyCKContainer sharedDummy];
-                  });
-                  method_setImplementation(mDefault, imp);
+                  Method mWithId = class_getClassMethod(ckClass, @selector(containerWithIdentifier:));
+                  if (mWithId) {
+                      IMP imp = imp_implementationWithBlock(^id(id _self, NSString *identifier) {
+                          return [DummyCKContainer sharedDummy];
+                      });
+                      method_setImplementation(mWithId, imp);
+                  }
               }
 
-              Method mWithId = class_getClassMethod(ckClass, @selector(containerWithIdentifier:));
-              if (mWithId) {
-                  IMP imp = imp_implementationWithBlock(^id(id _self, NSString *identifier) {
-                      return [DummyCKContainer sharedDummy];
+              // 2. 伪装 App Store 正式版收据路径（绕过 sandboxReceipt 检测）
+              Class bundleClass = [NSBundle class];
+              Method mReceipt = class_getInstanceMethod(bundleClass, @selector(appStoreReceiptURL));
+              if (mReceipt) {
+                  NSURL *(*origReceipt)(id, SEL) = (NSURL *(*)(id, SEL))method_getImplementation(mReceipt);
+                  IMP imp = imp_implementationWithBlock(^NSURL *(NSBundle *_self) {
+                      NSURL *url = origReceipt(_self, @selector(appStoreReceiptURL));
+                      if (url && [[url lastPathComponent] isEqualToString:@"sandboxReceipt"]) {
+                          return [[url URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"receipt"];
+                      }
+                      return url;
                   });
-                  method_setImplementation(mWithId, imp);
+                  method_setImplementation(mReceipt, imp);
+              }
+
+              // 3. 隐藏 embedded.mobileprovision（绕过 TestFlight / 重签文件检测）
+              Method mPath = class_getInstanceMethod(bundleClass, @selector(pathForResource:ofType:));
+              if (mPath) {
+                  NSString *(*origPath)(id, SEL, NSString *, NSString *) =
+                      (NSString *(*)(id, SEL, NSString *, NSString *))method_getImplementation(mPath);
+                  IMP imp = imp_implementationWithBlock(^NSString *(NSBundle *_self, NSString *name, NSString *ext) {
+                      if (([name isEqualToString:@"embedded"] && [ext isEqualToString:@"mobileprovision"]) ||
+                          ([name isEqualToString:@"embedded.mobileprovision"] && (!ext || ext.length == 0))) {
+                          return nil;
+                      }
+                      return origPath(_self, @selector(pathForResource:ofType:), name, ext);
+                  });
+                  method_setImplementation(mPath, imp);
+              }
+
+              Method mURL = class_getInstanceMethod(bundleClass, @selector(URLForResource:withExtension:));
+              if (mURL) {
+                  NSURL *(*origURL)(id, SEL, NSString *, NSString *) =
+                      (NSURL *(*)(id, SEL, NSString *, NSString *))method_getImplementation(mURL);
+                  IMP imp = imp_implementationWithBlock(^NSURL *(NSBundle *_self, NSString *name, NSString *ext) {
+                      if (([name isEqualToString:@"embedded"] && [ext isEqualToString:@"mobileprovision"]) ||
+                          ([name isEqualToString:@"embedded.mobileprovision"] && (!ext || ext.length == 0))) {
+                          return nil;
+                      }
+                      return origURL(_self, @selector(URLForResource:withExtension:), name, ext);
+                  });
+                  method_setImplementation(mURL, imp);
+              }
+
+              Class fmClass = [NSFileManager class];
+              Method mExists = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:));
+              if (mExists) {
+                  BOOL (*origExists)(id, SEL, NSString *) =
+                      (BOOL (*)(id, SEL, NSString *))method_getImplementation(mExists);
+                  IMP imp = imp_implementationWithBlock(^BOOL(NSFileManager *_self, NSString *path) {
+                      if ([path isKindOfClass:[NSString class]] && [path hasSuffix:@"embedded.mobileprovision"]) {
+                          return NO;
+                      }
+                      return origExists(_self, @selector(fileExistsAtPath:), path);
+                  });
+                  method_setImplementation(mExists, imp);
+              }
+
+              Method mExistsDir = class_getInstanceMethod(fmClass, @selector(fileExistsAtPath:isDirectory:));
+              if (mExistsDir) {
+                  BOOL (*origExistsDir)(id, SEL, NSString *, BOOL *) =
+                      (BOOL (*)(id, SEL, NSString *, BOOL *))method_getImplementation(mExistsDir);
+                  IMP imp = imp_implementationWithBlock(^BOOL(NSFileManager *_self, NSString *path, BOOL *isDir) {
+                      if ([path isKindOfClass:[NSString class]] && [path hasSuffix:@"embedded.mobileprovision"]) {
+                          return NO;
+                      }
+                      return origExistsDir(_self, @selector(fileExistsAtPath:isDirectory:), path, isDir);
+                  });
+                  method_setImplementation(mExistsDir, imp);
               }
           }
           EOF
